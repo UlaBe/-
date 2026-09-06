@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
 from app.ui import Ui_MainWindow
 import webbrowser
 from app.videoHelper import StopRequested, start as start_video_helper
+from app.cookie_fetcher import CookieFetcher
 
 
 csrftoken = ""
@@ -33,7 +34,35 @@ def resource_path(relative_path):
 
 
 def app_icon():
-    return QIcon(resource_path("icon.png"))
+    return QIcon(resource_path("app/Maodie.ico"))
+
+
+class CookieFetchThread(QThread):
+    """Background thread for fetching cookies from browser."""
+    output_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._is_running = True
+
+    def run(self):
+        try:
+            fetcher = CookieFetcher(
+                log_callback=self.output_signal.emit,
+                stop_callback=lambda: not self._is_running,
+            )
+            # 直接打开浏览器窗口供用户登录，不再尝试本地浏览器cookies
+            cookies = fetcher.fetch_cookies()
+            self.finished_signal.emit(cookies)
+        except ImportError as e:
+            self.error_signal.emit(str(e))
+        except Exception as e:
+            self.error_signal.emit(f"获取参数失败: {str(e)}")
+
+    def stop(self):
+        self._is_running = False
 
 
 class HelpMessageBox(QMessageBox):
@@ -46,7 +75,11 @@ class HelpMessageBox(QMessageBox):
 
         self.label = QLabel()
         self.label.setText(
-            "\n\n浏览器登录上雨课堂，然后按 F12 --> 选 Application --> 找到雨课堂的 cookies，"
+            "\n\n【方法一：一键获取（推荐）】\n"
+            "点击「一键获取」按钮，会自动从浏览器读取已登录的cookies，\n"
+            "或打开浏览器窗口供您登录后自动提取参数。\n\n"
+            "【方法二：手动填写】\n"
+            "浏览器登录上雨课堂，然后按 F12 --> 选 Application --> 找到雨课堂的 cookies，"
             "寻找 csrftoken、sessionid、\n\nuniversity_id 字段\n\n"
             "如果出现报错可以尝试关闭代理\n\n"
             "反馈问题邮箱 nuozanxinye921.gmail.com\n\n"
@@ -166,8 +199,10 @@ class mywindow(QMainWindow, Ui_MainWindow):
         self.start.clicked.connect(self.startprocess)
         self.stop.clicked.connect(self.stopprocess)
         self.help.clicked.connect(self.show_help)
+        self.auto_fetch.clicked.connect(self.auto_fetch_cookies)
         self.go_web.clicked.connect(self.open_website)
         self.sub_thread = None
+        self.cookie_thread = None
         self.input_dialog = InputDialog(self)
         self.input_dialog.input_signal.connect(self.send_input_to_worker)
         self.stop.setEnabled(False)
@@ -197,9 +232,13 @@ class mywindow(QMainWindow, Ui_MainWindow):
         self.sub_thread.start()
 
     def stopprocess(self):
-        if self.sub_thread:
+        if self.sub_thread and self.sub_thread.isRunning():
             self.sub_thread.stop()
-            self.textBrowser.append("正在停止任务...")
+            self.textBrowser.append("正在停止刷课任务...")
+        if self.cookie_thread and self.cookie_thread.isRunning():
+            self.cookie_thread.stop()
+            self.textBrowser.append("正在停止获取参数...")
+            self.auto_fetch.setEnabled(True)
 
     def update_text_browser(self, text):
         self.textBrowser.append(text)
@@ -227,6 +266,47 @@ class mywindow(QMainWindow, Ui_MainWindow):
     def check_scroll_position(self, value):
         scrollbar = self.textBrowser.verticalScrollBar()
         self.auto_scroll = value >= scrollbar.maximum() - 5
+
+    def auto_fetch_cookies(self):
+        """Start the auto cookie fetch process."""
+        if self.cookie_thread and self.cookie_thread.isRunning():
+            QMessageBox.information(self, "提示", "正在获取参数中，请等待...")
+            return
+
+        self.auto_fetch.setEnabled(False)
+        self.textBrowser.append("=" * 50)
+        self.textBrowser.append("开始自动获取登录参数...")
+
+        self.cookie_thread = CookieFetchThread()
+        self.cookie_thread.output_signal.connect(self.update_text_browser)
+        self.cookie_thread.finished_signal.connect(self.on_cookies_fetched)
+        self.cookie_thread.error_signal.connect(self.on_cookie_fetch_error)
+        self.cookie_thread.start()
+
+    def on_cookies_fetched(self, cookies):
+        """Handle successfully fetched cookies."""
+        csrftoken = cookies.get("csrftoken", "")
+        sessionid = cookies.get("sessionid", "")
+        university_id = cookies.get("university_id", "")
+
+        # Fill in the input fields
+        self.csrftoken_input.setPlainText(csrftoken)
+        self.sessionid_input.setPlainText(sessionid)
+        self.university_id_input.setPlainText(university_id)
+
+        self.textBrowser.append("[OK] 参数已自动填充到对应输入框！")
+        self.textBrowser.append("请点击「启动」开始刷课")
+        self.textBrowser.append("=" * 50)
+        self.auto_fetch.setEnabled(True)
+        self.cookie_thread = None
+
+    def on_cookie_fetch_error(self, error_msg):
+        """Handle cookie fetch errors."""
+        self.textBrowser.append(f"[FAIL] {error_msg}")
+        self.textBrowser.append("请尝试手动填写参数，或点击「跳转至网页」登录后重试")
+        self.textBrowser.append("=" * 50)
+        self.auto_fetch.setEnabled(True)
+        self.cookie_thread = None
 
     def open_website(self):
         webbrowser.open("https://scut.yuketang.cn/pro/courselist")

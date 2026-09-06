@@ -31,26 +31,30 @@ class StopRequested(Exception):
 def make_headers(csrftoken, sessionid, university_id):
     return {
         "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) "
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/87.0.4280.67 Safari/537.36"
+            "Chrome/119.0.0.0 Safari/537.36"
         ),
         "Content-Type": "application/json",
-        "Cookie": (
-            "csrftoken="
-            + csrftoken
-            + "; sessionid="
-            + sessionid
-            + "; university_id="
-            + university_id
-            + "; platform_id=3"
-        ),
+        "Accept": "application/json, text/plain, */*",
         "x-csrftoken": csrftoken,
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "university-id": university_id,
         "xtbz": "cloud",
+        "Referer": "https://scut.yuketang.cn/v2/web/studentLog/",
+        "Origin": "https://scut.yuketang.cn",
+    }
+
+
+def make_cookies(csrftoken, sessionid, university_id):
+    """Build a cookie dict for requests (more reliable than Cookie header)."""
+    return {
+        "csrftoken": csrftoken,
+        "sessionid": sessionid,
+        "university_id": university_id,
+        "platform_id": "3",
     }
 
 
@@ -80,6 +84,7 @@ class VideoHelper:
         self.url_root = url_root
         self.learning_rate = learning_rate
         self.headers = make_headers(csrftoken, sessionid, university_id)
+        self.cookies = make_cookies(csrftoken, sessionid, university_id)
         self.log_callback = log_callback or _default_log
         self.input_callback = input_callback or _default_input
         self.stop_callback = stop_callback
@@ -89,6 +94,15 @@ class VideoHelper:
             + self.university_id
         )
         self.session = requests.Session()
+        # Pre-seed session cookies for the yuketang domain (both host-only and parent)
+        for name, value in self.cookies.items():
+            self.session.cookies.set(name, value, domain="scut.yuketang.cn", path="/")
+            self.session.cookies.set(name, value, domain=".yuketang.cn", path="/")
+
+        # Debug: log what cookies will be sent
+        self.log(f"Cookie准备就绪: csrftoken={csrftoken[:15]}... "
+                 f"sessionid={sessionid[:15]}... "
+                 f"university_id={university_id}")
 
     def log(self, message):
         self.log_callback(str(message))
@@ -105,7 +119,11 @@ class VideoHelper:
 
     def get(self, url):
         self.check_stop()
-        response = self.session.get(url=url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+        response = self.session.get(
+            url=url,
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT,
+        )
         self.check_stop()
         return response
 
@@ -241,9 +259,10 @@ class VideoHelper:
             + course_sign
         )
         homework_ids_response = self.get(get_homework_ids)
-        homework_json = json.loads(homework_ids_response.text)
+        text = homework_ids_response.text
         homework_dic = {}
         try:
+            homework_json = json.loads(text)
             for chapter in homework_json["data"]["course_chapter"]:
                 for section in chapter["section_leaf_list"]:
                     if "leaf_list" in section:
@@ -254,54 +273,164 @@ class VideoHelper:
                         homework_dic[section["id"]] = section["name"]
             self.log(course_name + "共有" + str(len(homework_dic)) + "个视频喔！")
             return homework_dic
-        except Exception:
+        except Exception as e:
             self.log("fail while getting homework_ids!!! please re-run this program!")
-            raise Exception("fail while getting homework_ids!!! please re-run this program!")
+            self.log(f"响应内容前200字: {text[:200]}")
+            raise Exception("获取视频列表失败！请重新点击「一键获取」获取最新参数后重试")
 
     def get_user_id(self):
-        user_id_url = self.url_root + "edu_admin/check_user_session/"
-        id_response = self.get(user_id_url)
+        """Get user_id by trying multiple known yuketang APIs."""
+        endpoints = [
+            self.url_root + "edu_admin/check_user_session/",
+            self.url_root + "v2/api/web/userinfo",
+            self.url_root + "api/v3/user/basic-info",
+        ]
 
-        try:
-            payload = json.loads(id_response.text)
-            user_id = payload.get("user_id")
-            if user_id is None and isinstance(payload.get("data"), dict):
-                user_id = payload["data"].get("user_id")
-            if user_id is not None:
-                return str(user_id).strip()
-        except Exception:
-            pass
+        last_error = None
+        for url in endpoints:
+            try:
+                name = url.split(self.url_root)[-1]
+                self.log(f"尝试获取user_id: {name}")
+                id_response = self.get(url)
+                text = id_response.text
+                self.log(f"  HTTP状态码: {id_response.status_code}")
+                self.log(f"  响应内容: {text[:200]}")
 
-        try:
-            return re.search(r'"user_id":(.+?)}', id_response.text).group(1).strip()
-        except Exception:
-            self.log("也许是网路问题，获取不了user_id,请试着重新运行")
-            raise Exception("也许是网路问题，获取不了user_id,请试着重新运行!!! please re-run this program!")
+                # Skip if it looks like an error page (HTML) or empty
+                if not text or "<html" in text.lower():
+                    last_error = f"接口返回异常内容: {text[:100]}"
+                    continue
+
+                # Try JSON parsing first
+                try:
+                    payload = json.loads(text)
+                    user_id = self._extract_user_id_from_json(payload)
+                    if user_id:
+                        self.log(f"成功获取 user_id: {user_id}")
+                        return user_id
+                except Exception:
+                    pass
+
+                # Fall back to regex (supports both comma and brace terminators)
+                m = re.search(r'"user_id"\s*:\s*"?(\d+)"?', text)
+                if m:
+                    user_id = m.group(1).strip()
+                    self.log(f"成功获取 user_id: {user_id}")
+                    return user_id
+
+                last_error = f"响应中没有找到 user_id: {text[:100]}"
+
+            except Exception as e:
+                last_error = str(e)
+                self.log(f"  请求异常: {e}")
+                continue
+
+        self.log("获取user_id失败，请确认cookie是否有效或重新获取参数")
+        if last_error:
+            self.log(f"详细信息: {last_error}")
+        raise Exception("获取user_id失败！请重新点击「一键获取」获取最新参数，或检查网络后重试")
+
+    def _extract_user_id_from_json(self, payload):
+        """Recursively search a JSON payload for user_id."""
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            for key in ("user_id", "userId", "uid", "id"):
+                if key in payload and payload[key] is not None:
+                    return str(payload[key]).strip()
+            # Recursively search nested dicts
+            for value in payload.values():
+                result = self._extract_user_id_from_json(value)
+                if result:
+                    return result
+        elif isinstance(payload, list):
+            for item in payload:
+                result = self._extract_user_id_from_json(item)
+                if result:
+                    return result
+        return None
 
     def get_courses(self):
-        get_classroom_id = (
+        """Get course list by trying multiple known yuketang APIs."""
+        # Old API (mooc-api) first
+        old_url = (
             self.url_root
             + "mooc-api/v1/lms/user/user-courses/?status=1&page=1&no_page=1"
             + "&term=latest&uv_id="
             + self.university_id
         )
-        classroom_id_response = self.get(get_classroom_id)
-        your_courses = []
+        # New API (v2) as fallback
+        new_url = self.url_root + "v2/api/web/courses/list?identity=2"
+
+        endpoints = [old_url, new_url]
+        last_error = None
+
+        for url in endpoints:
+            try:
+                self.log(f"尝试获取课程列表: {url.split(self.url_root)[-1][:40]}")
+                response = self.get(url)
+                text = response.text
+
+                if not text or "<html" in text.lower():
+                    last_error = f"接口返回异常内容: {text[:100]}"
+                    continue
+
+                courses = self._parse_courses(text)
+                if courses:
+                    self.log(f"成功获取到 {len(courses)} 门课程")
+                    return courses
+                last_error = "接口返回中没有找到课程列表"
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        self.log("fail while getting classroom_id!!! please re-run this program!")
+        if last_error:
+            self.log(f"详细信息: {last_error}")
+        raise Exception("获取课程列表失败！请重新点击「一键获取」获取最新参数，或检查网络后重试")
+
+    def _parse_courses(self, text):
+        """Parse course list from either old or new API response format."""
+        courses = []
         try:
-            for course in json.loads(classroom_id_response.text)["data"]["product_list"]:
-                your_courses.append(
+            payload = json.loads(text)
+        except Exception:
+            return courses
+
+        data = payload.get("data", {})
+
+        # New API format: data.list[].{classroom_id, course{name, id}, ...}
+        if isinstance(data, dict) and "list" in data:
+            for item in data["list"]:
+                course = item.get("course", {})
+                courses.append(
                     {
-                        "course_name": course["course_name"],
-                        "classroom_id": course["classroom_id"],
-                        "course_sign": course["course_sign"],
-                        "sku_id": course["sku_id"],
-                        "course_id": course["course_id"],
+                        "course_name": course.get("name", item.get("name", "未知课程")),
+                        "classroom_id": item.get("classroom_id"),
+                        "course_sign": item.get("course_sign", ""),
+                        "sku_id": item.get("sku_id", 0),
+                        "course_id": course.get("id", item.get("id", 0)),
                     }
                 )
-        except Exception:
-            self.log("fail while getting classroom_id!!! please re-run this program!")
-            raise Exception("fail while getting classroom_id!!! please re-run this program!")
-        return your_courses
+            if courses:
+                return courses
+
+        # Old API format: data.product_list[].{course_name, classroom_id, ...}
+        if isinstance(data, dict) and "product_list" in data:
+            for course in data["product_list"]:
+                courses.append(
+                    {
+                        "course_name": course.get("course_name", "未知课程"),
+                        "classroom_id": course.get("classroom_id"),
+                        "course_sign": course.get("course_sign", ""),
+                        "sku_id": course.get("sku_id", 0),
+                        "course_id": course.get("course_id", 0),
+                    }
+                )
+            if courses:
+                return courses
+
+        return courses
 
     def ask_course_number(self, your_courses):
         prompt = "你想刷哪门课呢？请输入编号。输入0表示全部课程都刷一遍"
