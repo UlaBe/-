@@ -20,5 +20,5 @@ https://github.com/Cat1007/yuketangHelperSCUTLite
 1. 下载release
 2. 按照帮助使用
 
-
-
+点点stars谢谢喵
+点点stars谢谢喵
